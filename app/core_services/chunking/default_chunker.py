@@ -26,8 +26,8 @@ class TokenChunker:
     This chunker splits text into chunks based on token count rather than
     character count, which provides more consistent chunk sizes for LLMs.
 
-    Default settings (512 tokens, 50 overlap) are optimized for RAG:
-    - 512 tokens fits well in most embedding models
+    Default settings (312 tokens, 50 overlap) are optimized for RAG:
+    - 312 tokens fits well in most embedding models
     - 50 token overlap (~10%) maintains context continuity
     """
 
@@ -41,7 +41,7 @@ class TokenChunker:
         Initialize the TokenChunker.
 
         Args:
-            chunk_size: Maximum number of tokens per chunk. Default: 512
+            chunk_size: Maximum number of tokens per chunk. Default: 312
             chunk_overlap: Number of overlapping tokens between chunks. Default: 50
             encoding_name: Tiktoken encoding name. Default: 'cl100k_base' (GPT-4/Claude)
 
