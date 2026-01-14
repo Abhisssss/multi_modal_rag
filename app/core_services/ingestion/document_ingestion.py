@@ -3,6 +3,7 @@
 
 A complete pipeline for ingesting PDF documents into the RAG system.
 Handles text extraction, chunking, embedding, and vector storage.
+Supports multi-modal ingestion with both text and image embeddings.
 """
 
 import logging
@@ -14,11 +15,13 @@ from app.core_services.chunking.default_chunker import TokenChunker
 from app.core_services.embeddings.cohere_embeddings import CohereEmbeddings
 from app.core_services.file_parsers.pdf_parser import PDFParser
 from app.core_services.vectorstores.pinecone_client import PineconeVectorStore
+from app.utils.files import encode_image_to_data_url
 
 log = logging.getLogger(__name__)
 
 # Default batch size for embedding and upserting
 DEFAULT_BATCH_SIZE = 50
+IMAGE_BATCH_SIZE = 5  # Smaller batch for images due to size
 
 
 class DocumentIngestionPipeline:
@@ -28,8 +31,8 @@ class DocumentIngestionPipeline:
     This pipeline handles the complete workflow:
     1. PDF parsing (text and image extraction)
     2. Text chunking with overlap
-    3. Batch embedding generation
-    4. Vector storage with metadata
+    3. Batch embedding generation (text and images)
+    4. Vector storage with metadata (type: text/image)
     """
 
     def __init__(
@@ -71,17 +74,16 @@ class DocumentIngestionPipeline:
 
     def _sanitize_filename(self, filename: str) -> str:
         """Sanitize filename for use in vector IDs."""
-        # Remove extension
         name = Path(filename).stem
-        # Replace non-alphanumeric characters with underscores
         name = re.sub(r"[^a-zA-Z0-9_-]", "_", name)
-        # Remove consecutive underscores
         name = re.sub(r"_+", "_", name)
         return name.lower().strip("_")
 
-    def _create_vector_id(self, filename: str, chunk_index: int) -> str:
-        """Create a unique vector ID from filename and chunk index."""
+    def _create_vector_id(self, filename: str, chunk_index: int, vector_type: str = "text") -> str:
+        """Create a unique vector ID from filename, index, and type."""
         sanitized = self._sanitize_filename(filename)
+        if vector_type == "image":
+            return f"{sanitized}_img_{chunk_index:04d}"
         return f"{sanitized}_chunk_{chunk_index:04d}"
 
     def ingest_pdf(
@@ -90,6 +92,7 @@ class DocumentIngestionPipeline:
         filename: str,
         namespace: str = "",
         extract_images: bool = True,
+        embed_images: bool = True,
         additional_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
@@ -98,27 +101,20 @@ class DocumentIngestionPipeline:
         This method performs the complete ingestion workflow:
         1. Parse PDF and extract text/images
         2. Chunk the extracted text
-        3. Generate embeddings in batches
-        4. Upsert vectors to Pinecone with metadata
+        3. Generate text embeddings in batches
+        4. Generate image embeddings (if enabled)
+        5. Upsert all vectors to Pinecone with metadata
 
         Args:
             file_source: PDF file as path or bytes.
             filename: Original filename of the PDF.
             namespace: Pinecone namespace for vectors.
             extract_images: Whether to extract images from PDF.
-            additional_metadata: Optional extra metadata to include with each chunk.
+            embed_images: Whether to embed images and store in vector DB.
+            additional_metadata: Optional extra metadata to include.
 
         Returns:
-            Dict containing:
-                - document_id: Unique identifier for the document.
-                - filename: Original filename.
-                - pdf_path: Path to stored PDF.
-                - image_dir: Path to extracted images (if any).
-                - total_chunks: Number of text chunks created.
-                - total_vectors: Number of vectors upserted.
-                - total_images: Number of images extracted.
-                - namespace: Pinecone namespace used.
-                - chunks_metadata: List of chunk metadata for reference.
+            Dict containing ingestion results and statistics.
         """
         log.info(f"Starting document ingestion for: {filename}")
 
@@ -128,10 +124,13 @@ class DocumentIngestionPipeline:
             "pdf_path": None,
             "image_dir": None,
             "total_chunks": 0,
+            "total_text_vectors": 0,
+            "total_image_vectors": 0,
             "total_vectors": 0,
             "total_images": 0,
             "namespace": namespace or "default",
             "chunks_metadata": [],
+            "images_metadata": [],
             "processing_stats": {},
         }
 
@@ -147,9 +146,11 @@ class DocumentIngestionPipeline:
             result["document_id"] = pdf_result["document_id"]
             result["pdf_path"] = pdf_result["pdf_info"]["file_path"]
 
+            extracted_images = []
             if extract_images and pdf_result.get("images"):
                 result["image_dir"] = pdf_result["images"]["output_dir"]
                 result["total_images"] = pdf_result["images"]["total_images"]
+                extracted_images = pdf_result["images"]["images"]
 
             markdown_text = pdf_result["markdown"]
             text_blocks = pdf_result["text_blocks"]
@@ -178,102 +179,45 @@ class DocumentIngestionPipeline:
             result["total_chunks"] = len(chunks)
             log.info(f"Created {len(chunks)} chunks from document")
 
-            if not chunks:
-                log.warning("No chunks created from document. Skipping embedding.")
-                return result
-
-            # Step 3 & 4: Embed and upsert in batches
-            log.info(f"Step 3 & 4: Embedding and upserting in batches of {self.batch_size}...")
-
-            total_upserted = 0
-            chunks_metadata = []
-
-            # Process chunks in batches
-            for batch_start in range(0, len(chunks), self.batch_size):
-                batch_end = min(batch_start + self.batch_size, len(chunks))
-                batch_chunks = chunks[batch_start:batch_end]
-
-                log.info(f"Processing batch {batch_start // self.batch_size + 1}: chunks {batch_start}-{batch_end - 1}")
-
-                # Extract texts for embedding
-                batch_texts = [chunk["text"] for chunk in batch_chunks]
-
-                # Generate embeddings for batch
-                embed_result = self.embeddings.embed_texts(
-                    texts=batch_texts,
-                    input_type="search_document",
-                )
-                embeddings = embed_result["embeddings"]
-
-                # Prepare vectors for Pinecone
-                vectors = []
-                for i, (chunk, embedding) in enumerate(zip(batch_chunks, embeddings)):
-                    chunk_index = batch_start + i
-                    vector_id = self._create_vector_id(filename, chunk_index)
-
-                    # Build comprehensive metadata
-                    metadata = {
-                        "text": chunk["text"],
-                        "chunk_index": chunk_index,
-                        "document_id": result["document_id"],
-                        "filename": filename,
-                        "file_path": result["pdf_path"],
-                        "token_count": chunk["metadata"].get("token_count", 0),
-                        "total_chunks": result["total_chunks"],
-                    }
-
-                    # Add page number estimation based on position
-                    # (approximate based on chunk position in document)
-                    if text_blocks:
-                        # Estimate page from text blocks if available
-                        estimated_page = self._estimate_page_number(
-                            chunk["text"], text_blocks
-                        )
-                        metadata["page_number"] = estimated_page
-                    else:
-                        metadata["page_number"] = 1
-
-                    # Add any additional metadata from chunk
-                    for key, value in chunk["metadata"].items():
-                        if key not in metadata:
-                            metadata[key] = value
-
-                    vector = {
-                        "id": vector_id,
-                        "values": embedding,
-                        "metadata": metadata,
-                    }
-                    vectors.append(vector)
-
-                    # Store chunk metadata for response
-                    chunks_metadata.append({
-                        "vector_id": vector_id,
-                        "chunk_index": chunk_index,
-                        "text_preview": chunk["text"][:100] + "..." if len(chunk["text"]) > 100 else chunk["text"],
-                        "token_count": metadata["token_count"],
-                        "page_number": metadata["page_number"],
-                    })
-
-                # Upsert batch to Pinecone
-                upsert_result = self.vector_store.upsert(
-                    vectors=vectors,
+            # Step 3: Embed and upsert TEXT chunks
+            if chunks:
+                log.info(f"Step 3: Embedding and upserting TEXT chunks in batches of {self.batch_size}...")
+                text_vectors_count, chunks_metadata = self._embed_and_upsert_texts(
+                    chunks=chunks,
+                    filename=filename,
+                    document_id=result["document_id"],
+                    pdf_path=result["pdf_path"],
+                    text_blocks=text_blocks,
                     namespace=namespace,
                 )
-                total_upserted += upsert_result["upserted_count"]
-                log.info(f"Upserted {upsert_result['upserted_count']} vectors")
+                result["total_text_vectors"] = text_vectors_count
+                result["chunks_metadata"] = chunks_metadata
 
-            result["total_vectors"] = total_upserted
-            result["chunks_metadata"] = chunks_metadata
+            # Step 4: Embed and upsert IMAGES
+            if embed_images and extracted_images:
+                log.info(f"Step 4: Embedding and upserting {len(extracted_images)} IMAGES...")
+                image_vectors_count, images_metadata = self._embed_and_upsert_images(
+                    images=extracted_images,
+                    filename=filename,
+                    document_id=result["document_id"],
+                    namespace=namespace,
+                )
+                result["total_image_vectors"] = image_vectors_count
+                result["images_metadata"] = images_metadata
+
+            result["total_vectors"] = result["total_text_vectors"] + result["total_image_vectors"]
             result["processing_stats"] = {
                 "markdown_length": len(markdown_text),
                 "estimated_tokens": pdf_result.get("stats", {}).get("estimated_tokens", 0),
                 "total_blocks": len(text_blocks),
-                "batches_processed": (len(chunks) + self.batch_size - 1) // self.batch_size,
+                "text_batches_processed": (len(chunks) + self.batch_size - 1) // self.batch_size if chunks else 0,
+                "image_batches_processed": (len(extracted_images) + IMAGE_BATCH_SIZE - 1) // IMAGE_BATCH_SIZE if extracted_images else 0,
             }
 
             log.info(
-                f"Document ingestion complete: {result['total_chunks']} chunks, "
-                f"{result['total_vectors']} vectors upserted"
+                f"Document ingestion complete: "
+                f"{result['total_text_vectors']} text vectors, "
+                f"{result['total_image_vectors']} image vectors"
             )
 
             return result
@@ -282,30 +226,178 @@ class DocumentIngestionPipeline:
             log.error(f"Document ingestion failed: {e}", exc_info=True)
             raise
 
+    def _embed_and_upsert_texts(
+        self,
+        chunks: List[Dict[str, Any]],
+        filename: str,
+        document_id: str,
+        pdf_path: str,
+        text_blocks: List[Dict[str, Any]],
+        namespace: str,
+    ) -> tuple:
+        """Embed text chunks and upsert to Pinecone."""
+        total_upserted = 0
+        chunks_metadata = []
+
+        for batch_start in range(0, len(chunks), self.batch_size):
+            batch_end = min(batch_start + self.batch_size, len(chunks))
+            batch_chunks = chunks[batch_start:batch_end]
+
+            log.info(f"Processing text batch: chunks {batch_start}-{batch_end - 1}")
+
+            # Extract texts for embedding
+            batch_texts = [chunk["text"] for chunk in batch_chunks]
+
+            # Generate embeddings
+            embed_result = self.embeddings.embed_texts(
+                texts=batch_texts,
+                input_type="search_document",
+            )
+            embeddings = embed_result["embeddings"]
+
+            # Prepare vectors for Pinecone
+            vectors = []
+            for i, (chunk, embedding) in enumerate(zip(batch_chunks, embeddings)):
+                chunk_index = batch_start + i
+                vector_id = self._create_vector_id(filename, chunk_index, "text")
+
+                # Build metadata with type="text"
+                metadata = {
+                    "type": "text",  # Important for filtering
+                    "text": chunk["text"],
+                    "chunk_index": chunk_index,
+                    "document_id": document_id,
+                    "filename": filename,
+                    "file_path": pdf_path,
+                    "token_count": chunk["metadata"].get("token_count", 0),
+                    "total_chunks": len(chunks),
+                }
+
+                # Estimate page number
+                if text_blocks:
+                    metadata["page_number"] = self._estimate_page_number(chunk["text"], text_blocks)
+                else:
+                    metadata["page_number"] = 1
+
+                # Add additional metadata from chunk
+                for key, value in chunk["metadata"].items():
+                    if key not in metadata:
+                        metadata[key] = value
+
+                vectors.append({
+                    "id": vector_id,
+                    "values": embedding,
+                    "metadata": metadata,
+                })
+
+                chunks_metadata.append({
+                    "vector_id": vector_id,
+                    "chunk_index": chunk_index,
+                    "text_preview": chunk["text"][:100] + "..." if len(chunk["text"]) > 100 else chunk["text"],
+                    "token_count": metadata["token_count"],
+                    "page_number": metadata["page_number"],
+                })
+
+            # Upsert batch
+            upsert_result = self.vector_store.upsert(vectors=vectors, namespace=namespace)
+            total_upserted += upsert_result["upserted_count"]
+            log.info(f"Upserted {upsert_result['upserted_count']} text vectors")
+
+        return total_upserted, chunks_metadata
+
+    def _embed_and_upsert_images(
+        self,
+        images: List[Dict[str, Any]],
+        filename: str,
+        document_id: str,
+        namespace: str,
+    ) -> tuple:
+        """Embed images and upsert to Pinecone."""
+        total_upserted = 0
+        images_metadata = []
+
+        for batch_start in range(0, len(images), IMAGE_BATCH_SIZE):
+            batch_end = min(batch_start + IMAGE_BATCH_SIZE, len(images))
+            batch_images = images[batch_start:batch_end]
+
+            log.info(f"Processing image batch: images {batch_start}-{batch_end - 1}")
+
+            # Convert images to data URLs
+            image_data_urls = []
+            valid_images = []
+
+            for img_info in batch_images:
+                try:
+                    image_path = img_info["file_path"]
+                    data_url = encode_image_to_data_url(image_path)
+                    image_data_urls.append(data_url)
+                    valid_images.append(img_info)
+                except Exception as e:
+                    log.warning(f"Failed to encode image {img_info.get('file_path')}: {e}")
+                    continue
+
+            if not image_data_urls:
+                continue
+
+            # Generate image embeddings
+            embed_result = self.embeddings.embed_images(image_data_urls=image_data_urls)
+            embeddings = embed_result["embeddings"]
+
+            # Prepare vectors for Pinecone
+            vectors = []
+            for i, (img_info, embedding) in enumerate(zip(valid_images, embeddings)):
+                image_index = batch_start + i
+                vector_id = self._create_vector_id(filename, image_index, "image")
+
+                # Build metadata with type="image"
+                metadata = {
+                    "type": "image",  # Important for filtering
+                    "image_path": img_info["file_path"],
+                    "image_filename": img_info["filename"],
+                    "image_index": image_index,
+                    "document_id": document_id,
+                    "filename": filename,
+                    "page_number": img_info.get("page_number", 1),
+                    "width": img_info.get("width", 0),
+                    "height": img_info.get("height", 0),
+                }
+
+                vectors.append({
+                    "id": vector_id,
+                    "values": embedding,
+                    "metadata": metadata,
+                })
+
+                images_metadata.append({
+                    "vector_id": vector_id,
+                    "image_index": image_index,
+                    "image_path": img_info["file_path"],
+                    "page_number": metadata["page_number"],
+                })
+
+            # Upsert batch
+            upsert_result = self.vector_store.upsert(vectors=vectors, namespace=namespace)
+            total_upserted += upsert_result["upserted_count"]
+            log.info(f"Upserted {upsert_result['upserted_count']} image vectors")
+
+        return total_upserted, images_metadata
+
     def _estimate_page_number(
         self, chunk_text: str, text_blocks: List[Dict[str, Any]]
     ) -> int:
-        """
-        Estimate the page number for a chunk based on text matching.
-
-        Uses fuzzy matching against text blocks to find the most likely page.
-        """
+        """Estimate the page number for a chunk based on text matching."""
         if not text_blocks:
             return 1
 
-        # Take first 50 chars of chunk for matching
         chunk_start = chunk_text[:50].strip().lower()
-
         best_page = 1
         best_score = 0
 
         for block in text_blocks:
             block_text = block.get("text", "").lower()
             if chunk_start in block_text:
-                # Found a match, return this page
                 return block.get("metadata", {}).get("page_number", 1)
 
-            # Simple overlap scoring
             overlap = sum(1 for c in chunk_start if c in block_text)
             if overlap > best_score:
                 best_score = overlap
@@ -314,18 +406,8 @@ class DocumentIngestionPipeline:
         return best_page
 
     def get_document_stats(self, document_id: str, namespace: str = "") -> Dict[str, Any]:
-        """
-        Get statistics for an ingested document.
-
-        Args:
-            document_id: The document identifier.
-            namespace: The Pinecone namespace.
-
-        Returns:
-            Dict with document statistics from the vector store.
-        """
+        """Get statistics for an ingested document."""
         try:
-            # Query for vectors with this document_id
             index_stats = self.vector_store.describe_index_stats()
             return {
                 "document_id": document_id,
@@ -337,18 +419,8 @@ class DocumentIngestionPipeline:
             raise
 
     def delete_document(self, document_id: str, namespace: str = "") -> Dict[str, Any]:
-        """
-        Delete all vectors for a document from the vector store.
-
-        Args:
-            document_id: The document identifier.
-            namespace: The Pinecone namespace.
-
-        Returns:
-            Dict with deletion status.
-        """
+        """Delete all vectors (text and images) for a document."""
         try:
-            # Delete by filter on document_id
             result = self.vector_store.delete(
                 filter={"document_id": {"$eq": document_id}},
                 namespace=namespace,

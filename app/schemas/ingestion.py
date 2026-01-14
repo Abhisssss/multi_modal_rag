@@ -24,7 +24,8 @@ class ProcessingStats(BaseModel):
     markdown_length: int = Field(..., description="Length of extracted markdown text.")
     estimated_tokens: int = Field(..., description="Estimated total tokens in document.")
     total_blocks: int = Field(..., description="Total text blocks extracted.")
-    batches_processed: int = Field(..., description="Number of batches processed.")
+    text_batches_processed: int = Field(default=0, description="Number of text batches processed.")
+    image_batches_processed: int = Field(default=0, description="Number of image batches processed.")
 
 
 class IngestDocumentRequest(BaseModel):
@@ -73,8 +74,10 @@ class IngestDocumentResponse(BaseModel):
     pdf_path: str = Field(..., description="Path to the stored PDF file.")
     image_dir: Optional[str] = Field(None, description="Path to extracted images directory.")
     total_chunks: int = Field(..., description="Total number of text chunks created.")
-    total_vectors: int = Field(..., description="Total number of vectors upserted to Pinecone.")
-    total_images: int = Field(..., description="Total number of images extracted.")
+    total_text_vectors: int = Field(default=0, description="Total text vectors upserted to Pinecone.")
+    total_image_vectors: int = Field(default=0, description="Total image vectors upserted to Pinecone.")
+    total_vectors: int = Field(..., description="Total number of vectors upserted to Pinecone (text + image).")
+    total_images: int = Field(..., description="Total number of images extracted from PDF.")
     namespace: str = Field(..., description="Pinecone namespace where vectors are stored.")
     processing_stats: ProcessingStats = Field(..., description="Document processing statistics.")
     chunks_metadata: List[ChunkMetadataInfo] = Field(
@@ -90,14 +93,17 @@ class IngestDocumentResponse(BaseModel):
                 "pdf_path": "storage/pdfs/research_paper.pdf",
                 "image_dir": "storage/images/550e8400-e29b-41d4-a716-446655440000",
                 "total_chunks": 25,
-                "total_vectors": 25,
+                "total_text_vectors": 25,
+                "total_image_vectors": 5,
+                "total_vectors": 30,
                 "total_images": 5,
                 "namespace": "documents",
                 "processing_stats": {
                     "markdown_length": 15000,
                     "estimated_tokens": 3750,
                     "total_blocks": 45,
-                    "batches_processed": 1
+                    "text_batches_processed": 1,
+                    "image_batches_processed": 1
                 },
                 "chunks_metadata": [
                     {
