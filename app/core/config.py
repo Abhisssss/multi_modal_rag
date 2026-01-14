@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     PINECONE_API_KEY: str
     PINECONE_ENV: str
     PINECONE_INDEX: str
+    PINECONE_HOST: str
+    PINECONE_REGION: str
+    PINECONE_NAMESPACE: str
 
     # `SettingsConfigDict` is used to configure the behavior of the settings class.
     # `env_file=".env"` tells Pydantic to load environment variables from a file named `.env`.

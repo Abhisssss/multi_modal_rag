@@ -17,6 +17,7 @@ from app.core_services.file_parsers.pdf_parser import PDFParser
 from app.core_services.llm_clients.llm_factory import LLMFactory
 from app.core_services.rerankers.cohere_reranker import CohereReranker
 from app.core_services.storage.temp_file__store import TempFileStore
+from app.core_services.vectorstores.pinecone_client import PineconeVectorStore
 from app.schemas.embeddings import (
     TextEmbeddingRequest,
     EmbeddingResponse,
@@ -35,6 +36,16 @@ from app.schemas.pdf import (
     ImageExtractionResult,
 )
 from app.schemas.reranker import RerankerRequest, RerankerResponse
+from app.schemas.vectorstore import (
+    UpsertRequest,
+    UpsertResponse,
+    QueryRequest,
+    QueryResponse,
+    QueryMatch,
+    DeleteRequest,
+    DeleteResponse,
+    IndexStats,
+)
 from app.utils.files import encode_image_to_data_url
 
 # --- Router and Logger Setup ---
@@ -82,6 +93,11 @@ def get_temp_file_store():
 def get_pdf_parser():
     """Dependency to get an instance of PDFParser."""
     return PDFParser()
+
+
+def get_vectorstore():
+    """Dependency to get an instance of PineconeVectorStore."""
+    return PineconeVectorStore()
 
 
 # --- Helper Functions ---
@@ -540,6 +556,177 @@ async def extract_pdf_images(
         raise HTTPException(status_code=500, detail=f"Failed to extract images: {str(e)}")
 
 
+# --- Vector Store Endpoints ---
+
+@router.post("/vectorstore/upsert", response_model=UpsertResponse)
+async def upsert_vectors(
+    request: UpsertRequest,
+    vectorstore: PineconeVectorStore = Depends(get_vectorstore),
+):
+    """
+    Upserts vectors into the Pinecone vector store.
+
+    **Request Body:**
+    - **vectors**: List of vectors with id, values, and optional metadata.
+    - **namespace**: Namespace to upsert into (empty string for default).
+
+    Each vector must have:
+    - **id**: Unique identifier
+    - **values**: List of float values (the embedding)
+    - **metadata**: Optional dictionary of metadata
+    """
+    log.info(f"Received upsert request for {len(request.vectors)} vectors.")
+
+    try:
+        # Convert Pydantic models to dicts
+        vectors_data = [
+            {
+                "id": v.id,
+                "values": v.values,
+                "metadata": v.metadata
+            }
+            for v in request.vectors
+        ]
+
+        result = vectorstore.upsert(
+            vectors=vectors_data,
+            namespace=request.namespace
+        )
+
+        return UpsertResponse(
+            upserted_count=result["upserted_count"],
+            namespace=result["namespace"]
+        )
+
+    except ValueError as e:
+        log.warning(f"Validation error during upsert: {e}", exc_info=True)
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        log.error(f"Error during upsert: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to upsert vectors: {str(e)}")
+
+
+@router.post("/vectorstore/query", response_model=QueryResponse)
+async def query_vectors(
+    request: QueryRequest,
+    vectorstore: PineconeVectorStore = Depends(get_vectorstore),
+):
+    """
+    Queries the vector store for similar vectors.
+
+    **Request Body:**
+    - **vector**: The query vector (dense embedding).
+    - **top_k**: Number of top results to return.
+    - **namespace**: Namespace to query (empty string for default).
+    - **include_metadata**: Whether to include metadata in results.
+    - **include_values**: Whether to include vector values in results.
+    - **filter**: Optional metadata filter.
+
+    Returns a list of matching vectors with their similarity scores.
+    """
+    log.info(f"Received query request with top_k={request.top_k}")
+
+    try:
+        result = vectorstore.query(
+            vector=request.vector,
+            top_k=request.top_k,
+            namespace=request.namespace,
+            include_metadata=request.include_metadata,
+            include_values=request.include_values,
+            filter=request.filter
+        )
+
+        matches = [
+            QueryMatch(
+                id=m["id"],
+                score=m["score"],
+                metadata=m.get("metadata"),
+                values=m.get("values")
+            )
+            for m in result["matches"]
+        ]
+
+        return QueryResponse(
+            matches=matches,
+            namespace=result["namespace"],
+            top_k=result["top_k"],
+            total_matches=result["total_matches"]
+        )
+
+    except ValueError as e:
+        log.warning(f"Validation error during query: {e}", exc_info=True)
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        log.error(f"Error during query: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to query vectors: {str(e)}")
+
+
+@router.post("/vectorstore/delete", response_model=DeleteResponse)
+async def delete_vectors(
+    request: DeleteRequest,
+    vectorstore: PineconeVectorStore = Depends(get_vectorstore),
+):
+    """
+    Deletes vectors from the vector store.
+
+    **Request Body:**
+    - **ids**: List of vector IDs to delete (optional).
+    - **namespace**: Namespace to delete from.
+    - **delete_all**: If True, deletes all vectors in the namespace.
+    - **filter**: Optional metadata filter for deletion.
+
+    Must specify either 'ids', 'delete_all=True', or 'filter'.
+    """
+    log.info(f"Received delete request for namespace: {request.namespace or 'default'}")
+
+    try:
+        result = vectorstore.delete(
+            ids=request.ids,
+            namespace=request.namespace,
+            delete_all=request.delete_all,
+            filter=request.filter
+        )
+
+        return DeleteResponse(
+            deleted_ids=result.get("deleted_ids"),
+            deleted_count=result.get("count"),
+            deleted_all=result.get("deleted") == "all",
+            namespace=result["namespace"]
+        )
+
+    except ValueError as e:
+        log.warning(f"Validation error during delete: {e}", exc_info=True)
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        log.error(f"Error during delete: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to delete vectors: {str(e)}")
+
+
+@router.get("/vectorstore/stats", response_model=IndexStats)
+async def get_index_stats(
+    vectorstore: PineconeVectorStore = Depends(get_vectorstore),
+):
+    """
+    Gets statistics about the Pinecone index.
+
+    Returns dimension, total vector count, and per-namespace counts.
+    """
+    log.info("Received index stats request.")
+
+    try:
+        result = vectorstore.describe_index_stats()
+
+        return IndexStats(
+            dimension=result["dimension"],
+            total_vector_count=result["total_vector_count"],
+            namespaces=result["namespaces"]
+        )
+
+    except Exception as e:
+        log.error(f"Error fetching index stats: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to get index stats: {str(e)}")
+
+
 # --- Health Check Endpoints ---
 
 @router.get("/health/llm")
@@ -624,3 +811,24 @@ async def check_pdf_parser_health():
     except Exception as e:
         log.error(f"PDF parser health check failed: {e}", exc_info=True)
         raise HTTPException(status_code=503, detail=f"PDF parser service unhealthy: {str(e)}")
+
+
+@router.get("/health/vectorstore")
+async def check_vectorstore_health():
+    """
+    Health check for the Pinecone vector store service.
+    """
+    try:
+        client = PineconeVectorStore()
+        stats = client.describe_index_stats()
+        return {
+            "status": "healthy",
+            "service": "vectorstore",
+            "index_name": client.index_name,
+            "dimension": stats["dimension"],
+            "total_vector_count": stats["total_vector_count"],
+            "namespaces": list(stats["namespaces"].keys())
+        }
+    except Exception as e:
+        log.error(f"Vectorstore health check failed: {e}", exc_info=True)
+        raise HTTPException(status_code=503, detail=f"Vectorstore service unhealthy: {str(e)}")
