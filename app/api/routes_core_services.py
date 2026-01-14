@@ -12,12 +12,21 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 
+from app.core_services.chunking.default_chunker import TokenChunker
 from app.core_services.embeddings.cohere_embeddings import CohereEmbeddings
 from app.core_services.file_parsers.pdf_parser import PDFParser
 from app.core_services.llm_clients.llm_factory import LLMFactory
 from app.core_services.rerankers.cohere_reranker import CohereReranker
 from app.core_services.storage.temp_file__store import TempFileStore
 from app.core_services.vectorstores.pinecone_client import PineconeVectorStore
+from app.schemas.chunking import (
+    ChunkRequest,
+    ChunkBatchRequest,
+    ChunkResponse,
+    Chunk,
+    TokenCountRequest,
+    TokenCountResponse,
+)
 from app.schemas.embeddings import (
     TextEmbeddingRequest,
     EmbeddingResponse,
@@ -727,6 +736,141 @@ async def get_index_stats(
         raise HTTPException(status_code=500, detail=f"Failed to get index stats: {str(e)}")
 
 
+# --- Chunking Endpoints ---
+
+@router.post("/chunking/chunk", response_model=ChunkResponse)
+async def chunk_text(
+    request: ChunkRequest,
+):
+    """
+    Chunks a single text into smaller pieces based on token count.
+
+    **Default settings (optimized for RAG):**
+    - **chunk_size**: 512 tokens (fits well in embedding models)
+    - **chunk_overlap**: 50 tokens (~10% for context continuity)
+
+    **Request Body:**
+    - **text**: The text to chunk.
+    - **chunk_size**: Maximum tokens per chunk (50-8192).
+    - **chunk_overlap**: Overlapping tokens between chunks.
+    - **metadata**: Optional metadata to attach to all chunks.
+    """
+    log.info(f"Received chunk request: chunk_size={request.chunk_size}, overlap={request.chunk_overlap}")
+
+    try:
+        # Validate overlap is less than chunk size
+        if request.chunk_overlap >= request.chunk_size:
+            raise ValueError("chunk_overlap must be less than chunk_size.")
+
+        chunker = TokenChunker(
+            chunk_size=request.chunk_size,
+            chunk_overlap=request.chunk_overlap,
+        )
+
+        chunks_data = chunker.chunk_text(
+            text=request.text,
+            metadata=request.metadata,
+        )
+
+        chunks = [
+            Chunk(id=c["id"], text=c["text"], metadata=c["metadata"])
+            for c in chunks_data
+        ]
+
+        return ChunkResponse(
+            chunks=chunks,
+            total_chunks=len(chunks),
+            config=chunker.get_config(),
+        )
+
+    except ValueError as e:
+        log.warning(f"Validation error during chunking: {e}", exc_info=True)
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        log.error(f"Error during chunking: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to chunk text: {str(e)}")
+
+
+@router.post("/chunking/chunk-batch", response_model=ChunkResponse)
+async def chunk_texts_batch(
+    request: ChunkBatchRequest,
+):
+    """
+    Chunks multiple texts into smaller pieces.
+
+    Each text is chunked independently, maintaining document boundaries.
+    A `document_index` is added to each chunk's metadata.
+
+    **Request Body:**
+    - **texts**: List of texts to chunk.
+    - **chunk_size**: Maximum tokens per chunk.
+    - **chunk_overlap**: Overlapping tokens between chunks.
+    - **metadata_list**: Optional list of metadata (one per text).
+    """
+    log.info(f"Received batch chunk request: {len(request.texts)} texts")
+
+    try:
+        if request.chunk_overlap >= request.chunk_size:
+            raise ValueError("chunk_overlap must be less than chunk_size.")
+
+        if request.metadata_list and len(request.metadata_list) != len(request.texts):
+            raise ValueError("metadata_list must have same length as texts.")
+
+        chunker = TokenChunker(
+            chunk_size=request.chunk_size,
+            chunk_overlap=request.chunk_overlap,
+        )
+
+        chunks_data = chunker.chunk_texts(
+            texts=request.texts,
+            metadata_list=request.metadata_list,
+        )
+
+        chunks = [
+            Chunk(id=c["id"], text=c["text"], metadata=c["metadata"])
+            for c in chunks_data
+        ]
+
+        return ChunkResponse(
+            chunks=chunks,
+            total_chunks=len(chunks),
+            config=chunker.get_config(),
+        )
+
+    except ValueError as e:
+        log.warning(f"Validation error during batch chunking: {e}", exc_info=True)
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        log.error(f"Error during batch chunking: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to chunk texts: {str(e)}")
+
+
+@router.post("/chunking/count-tokens", response_model=TokenCountResponse)
+async def count_tokens(
+    request: TokenCountRequest,
+):
+    """
+    Counts the number of tokens in a text.
+
+    Uses the cl100k_base encoding (GPT-4/Claude compatible).
+    """
+    log.info("Received token count request.")
+
+    try:
+        chunker = TokenChunker()
+        token_count = chunker.count_tokens(request.text)
+
+        return TokenCountResponse(
+            token_count=token_count,
+            text_length=len(request.text),
+            encoding=chunker.encoding_name,
+        )
+
+    except Exception as e:
+        log.error(f"Error counting tokens: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to count tokens: {str(e)}")
+
+
 # --- Health Check Endpoints ---
 
 @router.get("/health/llm")
@@ -832,3 +976,23 @@ async def check_vectorstore_health():
     except Exception as e:
         log.error(f"Vectorstore health check failed: {e}", exc_info=True)
         raise HTTPException(status_code=503, detail=f"Vectorstore service unhealthy: {str(e)}")
+
+
+@router.get("/health/chunker")
+async def check_chunker_health():
+    """
+    Health check for the chunker service.
+    """
+    try:
+        chunker = TokenChunker()
+        # Test with a simple string
+        test_tokens = chunker.count_tokens("Hello, world!")
+        return {
+            "status": "healthy",
+            "service": "chunker",
+            "config": chunker.get_config(),
+            "test_token_count": test_tokens
+        }
+    except Exception as e:
+        log.error(f"Chunker health check failed: {e}", exc_info=True)
+        raise HTTPException(status_code=503, detail=f"Chunker service unhealthy: {str(e)}")
