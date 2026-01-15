@@ -266,19 +266,70 @@ async def multimodal_rag_query(request: MultiModalRAGQueryRequest):
             for ctx in generation_result["context_used"]
         ]
 
-        # Extract image paths used
+        # Extract image paths used - filter out empty paths
         images_used = [
-            img.get("image_path", "") for img in generation_result.get("images_used", [])
+            img.get("image_path", "")
+            for img in generation_result.get("images_used", [])
+            if img.get("image_path")  # Only include non-empty paths
         ]
 
-        # Parse answer
+        log.info(f"Images used (filtered): {images_used}")
+
+        # Parse answer - ensure we extract clean text
         answer_data = generation_result["answer"]
+
+        # Extract the actual answer text, handling nested structures
+        answer_text = answer_data.get("answer")
+        confidence = answer_data.get("confidence")
+        sources = answer_data.get("sources", [])
+        images_referenced = answer_data.get("images_referenced", [])
+        reason = answer_data.get("reason")
+
+        # Handle case where answer is a nested dict
+        if isinstance(answer_text, dict):
+            log.warning(f"Answer is a dict, extracting inner answer: {type(answer_text)}")
+            confidence = answer_text.get("confidence", confidence)
+            sources = answer_text.get("sources", sources)
+            images_referenced = answer_text.get("images_referenced", images_referenced)
+            reason = answer_text.get("reason", reason)
+            answer_text = answer_text.get("answer", str(answer_text))
+
+        # Handle case where answer is a stringified dict
+        if isinstance(answer_text, str) and answer_text.strip().startswith("{"):
+            import json
+            import re
+            try:
+                # Try JSON first
+                parsed = json.loads(answer_text)
+                if isinstance(parsed, dict) and "answer" in parsed:
+                    log.warning("Answer was a JSON string, extracting inner answer")
+                    answer_text = parsed.get("answer", answer_text)
+                    confidence = parsed.get("confidence", confidence)
+                    sources = parsed.get("sources", sources)
+                    images_referenced = parsed.get("images_referenced", images_referenced)
+            except json.JSONDecodeError:
+                # Try Python dict format
+                try:
+                    dict_str = answer_text.strip().replace("'", '"')
+                    dict_str = re.sub(r'\bNone\b', 'null', dict_str)
+                    dict_str = re.sub(r'\bTrue\b', 'true', dict_str)
+                    dict_str = re.sub(r'\bFalse\b', 'false', dict_str)
+                    parsed = json.loads(dict_str)
+                    if isinstance(parsed, dict) and "answer" in parsed:
+                        log.warning("Answer was a Python dict string, extracting inner answer")
+                        answer_text = parsed.get("answer", answer_text)
+                        confidence = parsed.get("confidence", confidence)
+                        sources = parsed.get("sources", sources)
+                        images_referenced = parsed.get("images_referenced", images_referenced)
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+
         mm_answer = MultiModalRAGAnswer(
-            answer=answer_data.get("answer"),
-            confidence=answer_data.get("confidence"),
-            sources=answer_data.get("sources", []),
-            images_referenced=answer_data.get("images_referenced", []),
-            reason=answer_data.get("reason"),
+            answer=answer_text,
+            confidence=confidence,
+            sources=sources,
+            images_referenced=images_referenced,
+            reason=reason,
         )
 
         response = MultiModalRAGQueryResponse(

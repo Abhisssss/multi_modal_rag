@@ -6,6 +6,7 @@ retrieved images to generate answers using vision-capable LLMs.
 Images are fetched via vector search, not uploaded by users.
 """
 
+import ast
 import json
 import logging
 import re
@@ -29,15 +30,15 @@ MULTIMODAL_SYSTEM_PROMPT = """You are an advanced AI assistant that answers ques
 
 RULES:
 1. Answer using information from BOTH the retrieved text context AND the provided images.
-2. When referencing images in your answer, use the format: "As shown in Image 1, ..." or "Image 2 demonstrates..."
+2. When referencing images in your answer, use the format: "As shown in image_1, ..." or "image_2 demonstrates..."
 3. If the answer requires visual explanation, describe what's visible in the relevant image.
 4. Combine insights from both text and images when applicable.
 5. Always respond in valid JSON format:
    {{
-     "answer": "your detailed answer with image references like 'As shown in Image 1...'",
+     "answer": "your detailed answer with image references like 'As shown in image_1...'",
      "confidence": "high|medium|low",
      "sources": ["chunk_id_1", "chunk_id_2"],
-     "images_referenced": ["Image 1", "Image 2"]
+     "images_referenced": ["image_1", "image_2"]
    }}
 6. If the answer is not present in the context or images, respond with:
    {{"answer": null, "reason": "Information not found in the provided context or images"}}
@@ -138,15 +139,6 @@ class MultiModalRAGGenerator:
             # Build image descriptions and load images
             image_descriptions, image_data_urls, valid_images = self._prepare_images(images)
 
-            result["images_used"] = [
-                {
-                    "id": img.get("id"),
-                    "image_path": img.get("image_path"),
-                    "page_number": img.get("page_number", 1),
-                }
-                for img in valid_images
-            ]
-
             # Build the text part of the prompt
             prompt_text = self.system_prompt.format(
                 context=context_str,
@@ -181,7 +173,31 @@ class MultiModalRAGGenerator:
             # Parse JSON from response
             result["answer"] = self._parse_json_response(raw_response)
 
-            log.info("Multi-modal response generated successfully.")
+            # Filter images_used to only include actually referenced images
+            images_referenced = result["answer"].get("images_referenced", [])
+            log.info(f"Images referenced in answer: {images_referenced}")
+            log.info(f"Valid images available: {len(valid_images)}")
+            for i, img in enumerate(valid_images):
+                log.debug(f"  Valid image {i+1}: path={img.get('image_path')}")
+
+            filtered_images = self._filter_referenced_images(images_referenced, valid_images)
+            log.info(f"Filtered images count: {len(filtered_images)}")
+
+            # Update images_used with only the referenced images
+            result["images_used"] = [
+                {
+                    "id": img.get("id"),
+                    "image_path": img.get("image_path"),
+                    "page_number": img.get("page_number", 1),
+                }
+                for img in filtered_images
+            ]
+
+            log.info(f"Final images_used: {[img.get('image_path') for img in result['images_used']]}")
+            log.info(
+                f"Multi-modal response generated successfully. "
+                f"Images: {len(valid_images)} sent, {len(filtered_images)} referenced."
+            )
             return result
 
         except Exception as e:
@@ -248,12 +264,12 @@ Content:
                 data_urls.append(data_url)
                 valid_images.append(img)
 
-                # Build description
+                # Build description using image_N format
                 filename = img.get("image_filename", Path(image_path).name)
                 page_num = img.get("page_number", "N/A")
                 doc_filename = img.get("filename", "N/A")
 
-                description = f"Image {len(valid_images)}: {filename} (from {doc_filename}, page {page_num})"
+                description = f"image_{len(valid_images)}: {filename} (from {doc_filename}, page {page_num})"
                 descriptions.append(description)
 
             except Exception as e:
@@ -265,55 +281,188 @@ Content:
 
         return "\n".join(descriptions), data_urls, valid_images
 
+    def _filter_referenced_images(
+        self, images_referenced: List[str], valid_images: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Filter images to only include those actually referenced in the answer.
+
+        Args:
+            images_referenced: List of image references (e.g., ["image_1", "image_2"])
+            valid_images: List of all valid images sent to the LLM
+
+        Returns:
+            Filtered list of images that were actually referenced
+        """
+        if not images_referenced or not valid_images:
+            return []
+
+        referenced_indices = set()
+        for ref in images_referenced:
+            # Parse image reference like "image_1", "image_2", etc.
+            # Also handle legacy format "Image 1", "Image 2"
+            ref_lower = ref.lower().strip()
+
+            # Try image_N format
+            if ref_lower.startswith("image_"):
+                try:
+                    idx = int(ref_lower.replace("image_", ""))
+                    referenced_indices.add(idx)
+                except ValueError:
+                    pass
+            # Try "Image N" format (legacy)
+            elif ref_lower.startswith("image "):
+                try:
+                    idx = int(ref_lower.replace("image ", ""))
+                    referenced_indices.add(idx)
+                except ValueError:
+                    pass
+
+        # Filter images (1-indexed)
+        filtered = []
+        for i, img in enumerate(valid_images, 1):
+            if i in referenced_indices:
+                filtered.append(img)
+
+        log.debug(f"Filtered images: {len(filtered)} of {len(valid_images)} referenced")
+        return filtered
+
     def _parse_json_response(self, response: str) -> Dict[str, Any]:
         """Parse JSON from LLM response, handling various formats."""
         if not response:
             return {"answer": None, "reason": "Empty response from LLM"}
 
         response = response.strip()
+        parsed = None
 
         # Try direct JSON parse
         try:
-            return json.loads(response)
+            parsed = json.loads(response)
         except json.JSONDecodeError:
             pass
 
         # Try to extract JSON from markdown code blocks
-        json_patterns = [
-            r'```json\s*([\s\S]*?)\s*```',
-            r'```\s*([\s\S]*?)\s*```',
-            r'\{[\s\S]*\}',
-        ]
+        if parsed is None:
+            json_patterns = [
+                r'```json\s*([\s\S]*?)\s*```',
+                r'```\s*([\s\S]*?)\s*```',
+                r'\{[\s\S]*\}',
+            ]
 
-        for pattern in json_patterns:
-            match = re.search(pattern, response)
-            if match:
+            for pattern in json_patterns:
+                match = re.search(pattern, response)
+                if match:
+                    try:
+                        json_str = match.group(1) if '```' in pattern else match.group(0)
+                        parsed = json.loads(json_str.strip())
+                        break
+                    except (json.JSONDecodeError, IndexError):
+                        continue
+
+        # Try parsing Python dict format using ast.literal_eval (handles single quotes properly)
+        if parsed is None:
+            try:
+                match = re.search(r'\{[\s\S]*\}', response)
+                if match:
+                    dict_str = match.group(0)
+                    # Use ast.literal_eval which properly handles Python dict format
+                    # including single quotes and apostrophes in string values
+                    parsed = ast.literal_eval(dict_str)
+                    if isinstance(parsed, dict):
+                        log.info("Successfully parsed response using ast.literal_eval")
+                    else:
+                        parsed = None
+            except (ValueError, SyntaxError) as e:
+                log.warning(f"ast.literal_eval failed: {e}")
+                # Fallback: try manual conversion
                 try:
-                    json_str = match.group(1) if '```' in pattern else match.group(0)
-                    return json.loads(json_str.strip())
-                except (json.JSONDecodeError, IndexError):
-                    continue
-
-        # Try parsing Python dict format (single quotes, None, True, False)
-        try:
-            # Find the JSON-like structure
-            match = re.search(r'\{[\s\S]*\}', response)
-            if match:
-                dict_str = match.group(0)
-                # Convert Python dict to JSON format
-                json_str = dict_str.replace("'", '"')
-                json_str = re.sub(r'\bNone\b', 'null', json_str)
-                json_str = re.sub(r'\bTrue\b', 'true', json_str)
-                json_str = re.sub(r'\bFalse\b', 'false', json_str)
-                return json.loads(json_str)
-        except (json.JSONDecodeError, AttributeError):
-            pass
+                    dict_str = match.group(0)
+                    json_str = dict_str.replace("'", '"')
+                    json_str = re.sub(r'\bNone\b', 'null', json_str)
+                    json_str = re.sub(r'\bTrue\b', 'true', json_str)
+                    json_str = re.sub(r'\bFalse\b', 'false', json_str)
+                    parsed = json.loads(json_str)
+                except (json.JSONDecodeError, AttributeError):
+                    pass
 
         # Fallback: return raw response as answer
-        log.warning("Could not parse JSON from multi-modal response. Returning raw text.")
+        if parsed is None:
+            log.warning("Could not parse JSON from multi-modal response. Returning raw text.")
+            return {
+                "answer": response,
+                "confidence": "medium",
+                "sources": [],
+                "images_referenced": [],
+            }
+
+        # Sanitize the parsed response to ensure clean structure
+        return self._sanitize_parsed_response(parsed)
+
+    def _sanitize_parsed_response(self, parsed: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Sanitize the parsed JSON response to ensure answer is always a clean text string.
+
+        Handles cases where:
+        - answer is a nested dict with its own 'answer' key
+        - answer is a JSON string that needs re-parsing
+        - answer is a Python dict string (single quotes) that needs conversion
+        - answer contains the full response structure
+        """
+        answer_value = parsed.get("answer")
+
+        # If answer is a dict, extract the inner answer
+        if isinstance(answer_value, dict):
+            # Check if it has a nested 'answer' key
+            if "answer" in answer_value:
+                inner_answer = answer_value.get("answer")
+                # Recursively sanitize if inner_answer is also complex
+                if isinstance(inner_answer, dict) and "answer" in inner_answer:
+                    return self._sanitize_parsed_response(inner_answer)
+                # Use the nested structure's fields
+                return {
+                    "answer": inner_answer if isinstance(inner_answer, str) else str(inner_answer) if inner_answer else None,
+                    "confidence": answer_value.get("confidence", parsed.get("confidence")),
+                    "sources": answer_value.get("sources", parsed.get("sources", [])),
+                    "images_referenced": answer_value.get("images_referenced", parsed.get("images_referenced", [])),
+                    "reason": answer_value.get("reason", parsed.get("reason")),
+                }
+            else:
+                # answer is a dict but doesn't have nested answer, convert to string
+                log.warning("Answer field is a dict without nested answer, converting to string.")
+                return {
+                    "answer": str(answer_value),
+                    "confidence": parsed.get("confidence"),
+                    "sources": parsed.get("sources", []),
+                    "images_referenced": parsed.get("images_referenced", []),
+                    "reason": parsed.get("reason"),
+                }
+
+        # If answer is a string, check if it looks like a JSON/dict string
+        if isinstance(answer_value, str) and answer_value.strip().startswith("{"):
+            try:
+                # Try to parse as JSON first
+                inner_parsed = json.loads(answer_value)
+                if isinstance(inner_parsed, dict) and "answer" in inner_parsed:
+                    return self._sanitize_parsed_response(inner_parsed)
+            except json.JSONDecodeError:
+                # Try to parse as Python dict format (single quotes)
+                try:
+                    dict_str = answer_value.strip()
+                    json_str = dict_str.replace("'", '"')
+                    json_str = re.sub(r'\bNone\b', 'null', json_str)
+                    json_str = re.sub(r'\bTrue\b', 'true', json_str)
+                    json_str = re.sub(r'\bFalse\b', 'false', json_str)
+                    inner_parsed = json.loads(json_str)
+                    if isinstance(inner_parsed, dict) and "answer" in inner_parsed:
+                        return self._sanitize_parsed_response(inner_parsed)
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+
+        # Answer is already a clean string or null
         return {
-            "answer": response,
-            "confidence": "medium",
-            "sources": [],
-            "images_referenced": [],
+            "answer": answer_value,
+            "confidence": parsed.get("confidence"),
+            "sources": parsed.get("sources", []),
+            "images_referenced": parsed.get("images_referenced", []),
+            "reason": parsed.get("reason"),
         }

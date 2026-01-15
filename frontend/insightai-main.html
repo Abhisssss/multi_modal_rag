@@ -2460,15 +2460,28 @@
 
         // Extract clean answer text from response data
         function extractAnswerText(data) {
-            // First check if answer.answer exists and is a proper string (not a dict representation)
-            if (data.answer && data.answer.answer) {
+            // First check if answer.answer exists
+            if (data.answer && data.answer.answer !== undefined && data.answer.answer !== null) {
                 const answerValue = data.answer.answer;
-                // Check if it's a dict-like string
-                if (typeof answerValue === 'string' && answerValue.trim().startsWith('{')) {
-                    const parsed = parsePythonDictOrJSON(answerValue);
-                    if (parsed && parsed.answer) return parsed.answer;
+
+                // Handle string answer
+                if (typeof answerValue === 'string') {
+                    const trimmed = answerValue.trim();
+                    // Check if it's a dict-like string
+                    if (trimmed.startsWith('{')) {
+                        const parsed = parsePythonDictOrJSON(trimmed);
+                        if (parsed && parsed.answer) return parsed.answer;
+                    }
+                    return answerValue;
                 }
-                return answerValue;
+
+                // Handle nested object
+                if (typeof answerValue === 'object' && answerValue.answer) {
+                    return answerValue.answer;
+                }
+
+                // Convert to string if it's some other type
+                return String(answerValue);
             }
 
             // Try to parse raw_response
@@ -2494,13 +2507,34 @@
             let imagesReferenced = [];
 
             if (data.answer) {
-                // Direct answer object from backend
-                if (data.answer.answer && typeof data.answer.answer === 'string') {
-                    answerText = data.answer.answer;
+                // Direct answer object from backend - handle various formats
+                if (data.answer.answer !== undefined && data.answer.answer !== null) {
+                    if (typeof data.answer.answer === 'string') {
+                        // Check if it's a stringified dict/JSON
+                        const trimmedAnswer = data.answer.answer.trim();
+                        if (trimmedAnswer.startsWith('{')) {
+                            const parsed = parsePythonDictOrJSON(trimmedAnswer);
+                            if (parsed && parsed.answer) {
+                                answerText = parsed.answer;
+                                // Also extract other fields from nested structure
+                                confidence = confidence || parsed.confidence;
+                                imagesReferenced = imagesReferenced.length ? imagesReferenced : (parsed.images_referenced || []);
+                            } else {
+                                answerText = data.answer.answer;
+                            }
+                        } else {
+                            answerText = data.answer.answer;
+                        }
+                    } else if (typeof data.answer.answer === 'object' && data.answer.answer.answer) {
+                        // Handle nested answer object
+                        answerText = data.answer.answer.answer;
+                        confidence = confidence || data.answer.answer.confidence;
+                        imagesReferenced = imagesReferenced.length ? imagesReferenced : (data.answer.answer.images_referenced || []);
+                    }
                 }
-                confidence = data.answer.confidence || null;
-                reason = data.answer.reason || null;
-                imagesReferenced = data.answer.images_referenced || [];
+                confidence = confidence || data.answer.confidence || null;
+                reason = reason || data.answer.reason || null;
+                imagesReferenced = imagesReferenced.length ? imagesReferenced : (data.answer.images_referenced || []);
             }
 
             // Fallback to raw_response if no answer yet
@@ -2538,6 +2572,14 @@
 
             // Build images HTML for multimodal responses - show at the beginning
             let imagesHtml = '';
+
+            // Debug logging
+            console.log('=== Multimodal Response Debug ===');
+            console.log('isMultimodal:', isMultimodal);
+            console.log('images_used:', data.images_used);
+            console.log('images_referenced:', imagesReferenced);
+            console.log('Full response data:', data);
+
             if (isMultimodal && data.images_used && data.images_used.length > 0) {
                 const baseUrl = CONFIG.API.BASE_URL.replace('/api/v1', '');
                 const imageItems = data.images_used.map((imgPath, idx) => {
@@ -2549,17 +2591,30 @@
                         actualPath = imgPath.image_path;
                     }
 
+                    // Skip empty paths
+                    if (!actualPath || actualPath.trim() === '') {
+                        console.warn(`Image ${idx} has empty path, skipping`);
+                        return '';
+                    }
+
                     const imgUrl = actualPath.startsWith('http') ? actualPath : `${baseUrl}/${actualPath}`;
+                    console.log(`Image ${idx + 1} URL:`, imgUrl);
+
                     return `
                         <img src="${imgUrl}" alt="Referenced image ${idx + 1}"
                              class="message-image"
                              style="max-width:100%;max-height:300px;border-radius:8px;margin-bottom:12px;cursor:pointer;box-shadow:var(--shadow-md);"
                              onclick="openImageOverlay('${imgUrl}')"
+                             onerror="console.error('Failed to load image:', '${imgUrl}')"
                              title="Click to view full size">
                     `;
-                }).join('');
+                }).filter(item => item !== '').join('');
 
-                imagesHtml = `<div style="margin-bottom:12px;">${imageItems}</div>`;
+                if (imageItems) {
+                    imagesHtml = `<div style="margin-bottom:12px;">${imageItems}</div>`;
+                }
+            } else if (isMultimodal) {
+                console.warn('No images_used in response or empty array');
             }
 
             // Build sources HTML from retrieved_chunks with click handlers for PDF viewer
