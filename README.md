@@ -132,7 +132,7 @@ I absolutely used AI tools (Gemini CLI and Claude Code), but I used them careful
 
 - **The "Junior Developer" Approach**: I treat the AI like a junior developer. If I just say "add a caching feature," it won't understand the nuance. I have to say: "Utilize Redis, here is the location, add a Time-To-Live, and check this condition before retrieving."
 
-- **Planning**: I used Gemini CLI to brainstorm the initial architecture and project structure.
+- **Planning**: Initial architecture and project structure has to be carefully planned manually, and later brainstorm the idea, and enhancements for the same using AI, later using Gemini CLI for boilerplate level coding and Claude Code for heavy lifting or complex scenarios generated 90% of the code. its better to start with planning manually and enhance it using AI.
 
 - **Verification**: There is a 40% chance the AI doesn't understand the requirement or uses outdated libraries (since training data cuts off). I always ask for a "plan" first, review it, and then manually verify the code—especially for things like Pinecone or Embedding clients where versions change often.
 
