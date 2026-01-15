@@ -2,13 +2,17 @@
 const CONFIG = {
   // API Configuration
   API: {
-    BASE_URL: "http://192.28.3.186:8081/api/v1",
+    BASE_URL: "http://127.0.0.1:8000/api/v1",
     
     // Document Intelligence Endpoints
     DOCUMENT_INTELLIGENCE: {
-      UPLOAD_INGEST: "/documents_ingestion/upload-and-ingest",
-      CHAT: "/chat/",
-      STATUS: "/documents_ingestion/status"
+      UPLOAD_INGEST: "/ingest",           // POST - Upload & ingest PDF
+      QUERY: "/query",                    // POST - Text RAG query
+      QUERY_MULTIMODAL: "/query-multimodal", // POST - Multi-modal RAG query
+      MODELS: "/models",                  // GET - List available LLM models
+      DELETE_DOCUMENT: "/document",       // DELETE - Remove document vectors
+      DOCUMENT_STATS: "/document",        // GET - /document/{id}/stats
+      STATUS: "/status"                   // GET - RAG system status
     },
     
     // Code Intelligence Endpoints (Placeholder)
@@ -37,44 +41,72 @@ const CONFIG = {
     TIMEOUT: 30000 // 30 seconds
   },
   
-  // AI Models Configuration
+  // AI Models Configuration (from llm_factory.py)
   AI_MODELS: [
     {
-      id: "gpt-4-turbo",
-      name: "GPT-4 Turbo",
-      provider: "OpenAI",
-      description: "Most capable model for complex reasoning"
+      id: "groq_maverick",
+      name: "Llama 4 Maverick 17B",
+      provider: "Groq",
+      description: "Multi-modal model supporting text and images (default)"
     },
     {
-      id: "claude-3-5-sonnet",
-      name: "Claude 3.5 Sonnet",
-      provider: "Anthropic",
-      description: "Best for analysis and long documents"
+      id: "cohere_command_r_plus",
+      name: "Command R+",
+      provider: "Cohere",
+      description: "Powerful model for complex reasoning"
     },
     {
-      id: "gemini-pro",
-      name: "Gemini Pro",
-      provider: "Google",
+      id: "cohere_command_a",
+      name: "Command A",
+      provider: "Cohere",
+      description: "Latest Cohere model (2025)"
+    },
+    {
+      id: "groq_llama3_8b",
+      name: "Llama 3 8B",
+      provider: "Groq",
       description: "Fast and efficient for general tasks"
     },
     {
-      id: "llama-3-1-70b",
-      name: "Llama 3.1 70B",
-      provider: "Meta",
-      description: "Open-source powerhouse"
+      id: "groq_gemma_7b",
+      name: "Gemma 7B",
+      provider: "Groq",
+      description: "Google's open model via Groq"
+    },
+    {
+      id: "groq_mixtral_8x7b",
+      name: "Mixtral 8x7B",
+      provider: "Groq",
+      description: "Mixture of experts model"
     }
   ],
   
+  // RAG Query Defaults
+  RAG: {
+    DEFAULT_TOP_K: 10,           // Candidates to retrieve from vector DB
+    DEFAULT_TOP_N: 3,            // Results after reranking
+    DEFAULT_TEMPERATURE: 0.7,
+    DEFAULT_USE_RERANKER: true,
+    DEFAULT_MODEL: "groq_maverick"
+  },
+
+  // Ingestion Defaults
+  INGESTION: {
+    DEFAULT_CHUNK_SIZE: 312,     // Max tokens per chunk
+    DEFAULT_CHUNK_OVERLAP: 50,   // Overlap tokens between chunks
+    DEFAULT_EXTRACT_IMAGES: true,
+    DEFAULT_EMBED_IMAGES: true,
+    DEFAULT_NAMESPACE: "default"        // Pinecone namespace
+  },
+
   // Upload Configuration
   UPLOAD: {
-    // Document Intelligence
+    // Document Intelligence (Backend only supports PDF currently)
     DOCUMENT: {
-      SUPPORTED_FORMATS: [".pdf", ".docx", ".txt"],
-      MAX_FILE_SIZE: 10485760, // 10MB
+      SUPPORTED_FORMATS: [".pdf"],
+      MAX_FILE_SIZE: 52428800, // 50MB for PDFs
       ACCEPTED_MIME_TYPES: [
-        "application/pdf",
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "text/plain"
+        "application/pdf"
       ]
     },
     
@@ -103,7 +135,7 @@ const CONFIG = {
   // User Configuration
   USER: {
     DEFAULT_USERNAME: "user",
-    DEFAULT_COLLECTION: "default_collection"
+    DEFAULT_NAMESPACE: "default"  // Pinecone namespace (empty = default namespace)
   },
   
   // Polling Configuration
