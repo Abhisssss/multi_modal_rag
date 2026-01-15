@@ -1575,6 +1575,37 @@
     <!-- Toast Container -->
     <div class="toast-container" id="toastContainer"></div>
 
+    <!-- Image Overlay -->
+    <div id="imageOverlay" onclick="closeImageOverlay()" style="
+        display: none;
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: rgba(0, 0, 0, 0.9);
+        z-index: 10000;
+        cursor: pointer;
+        align-items: center;
+        justify-content: center;
+    ">
+        <img id="overlayImage" src="" alt="Full size image" style="
+            max-width: 90%;
+            max-height: 90%;
+            object-fit: contain;
+            border-radius: 8px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+        ">
+        <div style="
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            color: white;
+            font-size: 14px;
+            opacity: 0.7;
+        ">Click anywhere to close</div>
+    </div>
+
     <div class="app-container">
         <!-- Left Sidebar -->
         <aside class="sidebar" id="sidebar">
@@ -2315,23 +2346,42 @@
             const typingId = addTypingIndicator();
             
             try {
+                // Determine if we should use multimodal endpoint (groq_maverick supports vision)
+                const isMultimodal = AppState.selectedModel === 'groq_maverick';
+                const endpoint = isMultimodal
+                    ? CONFIG.API.DOCUMENT_INTELLIGENCE.QUERY_MULTIMODAL
+                    : CONFIG.API.DOCUMENT_INTELLIGENCE.QUERY;
+
+                // Build request body based on endpoint type
+                const requestBody = isMultimodal
+                    ? {
+                        query: message,
+                        namespace: AppState.currentNamespace,
+                        text_top_k: CONFIG.RAG.DEFAULT_TOP_K,
+                        text_top_n: CONFIG.RAG.DEFAULT_TOP_N,
+                        image_top_k: 5,  // Retrieve up to 5 relevant images
+                        temperature: CONFIG.RAG.DEFAULT_TEMPERATURE,
+                        use_reranker: CONFIG.RAG.DEFAULT_USE_RERANKER
+                    }
+                    : {
+                        query: message,
+                        namespace: AppState.currentNamespace,
+                        top_k: CONFIG.RAG.DEFAULT_TOP_K,
+                        top_n: CONFIG.RAG.DEFAULT_TOP_N,
+                        model_id: AppState.selectedModel,
+                        temperature: CONFIG.RAG.DEFAULT_TEMPERATURE,
+                        use_reranker: CONFIG.RAG.DEFAULT_USE_RERANKER
+                    };
+
                 const response = await fetch(
-                    `${CONFIG.API.BASE_URL}${CONFIG.API.DOCUMENT_INTELLIGENCE.QUERY}`,
+                    `${CONFIG.API.BASE_URL}${endpoint}`,
                     {
                         method: 'POST',
                         headers: {
                             'Content-Type': 'application/json',
                             'accept': 'application/json'
                         },
-                        body: JSON.stringify({
-                            query: message,
-                            namespace: AppState.currentNamespace,
-                            top_k: CONFIG.RAG.DEFAULT_TOP_K,
-                            top_n: CONFIG.RAG.DEFAULT_TOP_N,
-                            model_id: AppState.selectedModel,
-                            temperature: CONFIG.RAG.DEFAULT_TEMPERATURE,
-                            use_reranker: CONFIG.RAG.DEFAULT_USE_RERANKER
-                        })
+                        body: JSON.stringify(requestBody)
                     }
                 );
 
@@ -2345,11 +2395,11 @@
                 // Remove typing indicator
                 removeTypingIndicator(typingId);
 
-                // Add AI response
-                addAIMessage(data);
+                // Add AI response (handles both text and multimodal)
+                addAIMessage(data, isMultimodal);
 
-                // Add to conversation history (using the actual answer text)
-                const answerText = data.answer?.answer || data.raw_response || 'No answer generated';
+                // Add to conversation history
+                const answerText = extractAnswerText(data);
                 AppState.conversationHistory.push({
                     role: 'assistant',
                     content: answerText
@@ -2380,39 +2430,95 @@
             scrollToBottom();
         }
 
-        function addAIMessage(data) {
+        // Helper function to parse Python dict format or JSON
+        function parsePythonDictOrJSON(str) {
+            if (!str || typeof str !== 'string') return null;
+
+            const trimmed = str.trim();
+            if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return null;
+
+            try {
+                // First try standard JSON parse
+                return JSON.parse(trimmed);
+            } catch (e1) {
+                try {
+                    // Convert Python dict format to JSON:
+                    // - Replace single quotes with double quotes (but not inside strings)
+                    // - Handle None -> null, True -> true, False -> false
+                    let jsonStr = trimmed
+                        .replace(/'/g, '"')           // Replace single quotes
+                        .replace(/\bNone\b/g, 'null') // Python None -> null
+                        .replace(/\bTrue\b/g, 'true') // Python True -> true
+                        .replace(/\bFalse\b/g, 'false'); // Python False -> false
+                    return JSON.parse(jsonStr);
+                } catch (e2) {
+                    console.warn('Failed to parse response:', e2);
+                    return null;
+                }
+            }
+        }
+
+        // Extract clean answer text from response data
+        function extractAnswerText(data) {
+            // First check if answer.answer exists and is a proper string (not a dict representation)
+            if (data.answer && data.answer.answer) {
+                const answerValue = data.answer.answer;
+                // Check if it's a dict-like string
+                if (typeof answerValue === 'string' && answerValue.trim().startsWith('{')) {
+                    const parsed = parsePythonDictOrJSON(answerValue);
+                    if (parsed && parsed.answer) return parsed.answer;
+                }
+                return answerValue;
+            }
+
+            // Try to parse raw_response
+            if (data.raw_response) {
+                const parsed = parsePythonDictOrJSON(data.raw_response);
+                if (parsed && parsed.answer) return parsed.answer;
+                // If raw_response is plain text, return it
+                if (!data.raw_response.trim().startsWith('{')) return data.raw_response;
+            }
+
+            return 'No answer available.';
+        }
+
+        function addAIMessage(data, isMultimodal = false) {
             const messagesList = document.getElementById('messagesList');
             const message = document.createElement('div');
             message.className = 'message ai';
 
-            // Extract answer from backend response
-            let answerObj = data.answer || {};
+            // Extract answer - prioritize data.answer.answer if it exists
             let answerText = '';
-            let confidence = answerObj.confidence;
-            let reason = answerObj.reason;
+            let confidence = null;
+            let reason = null;
+            let imagesReferenced = [];
 
-            // Handle case where answer might be in raw_response as JSON string
-            if (answerObj.answer) {
-                answerText = answerObj.answer;
-            } else if (data.raw_response) {
-                // Try to parse raw_response if it's a JSON string
-                try {
-                    // Check if raw_response looks like JSON (starts with { or [)
-                    const trimmed = data.raw_response.trim();
-                    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
-                        const parsed = JSON.parse(trimmed.replace(/'/g, '"'));
-                        answerText = parsed.answer || parsed.response || data.raw_response;
-                        confidence = confidence || parsed.confidence;
-                        reason = reason || parsed.reason;
-                    } else {
-                        answerText = data.raw_response;
-                    }
-                } catch (e) {
-                    // If parsing fails, use raw_response as-is
+            if (data.answer) {
+                // Direct answer object from backend
+                if (data.answer.answer && typeof data.answer.answer === 'string') {
+                    answerText = data.answer.answer;
+                }
+                confidence = data.answer.confidence || null;
+                reason = data.answer.reason || null;
+                imagesReferenced = data.answer.images_referenced || [];
+            }
+
+            // Fallback to raw_response if no answer yet
+            if (!answerText && data.raw_response) {
+                const parsed = parsePythonDictOrJSON(data.raw_response);
+                if (parsed && parsed.answer) {
+                    answerText = parsed.answer;
+                    confidence = confidence || parsed.confidence;
+                    reason = reason || parsed.reason;
+                    imagesReferenced = imagesReferenced.length ? imagesReferenced : (parsed.images_referenced || []);
+                } else if (!data.raw_response.trim().startsWith('{')) {
                     answerText = data.raw_response;
                 }
-            } else {
-                answerText = 'No answer available.';
+            }
+
+            // Final fallback
+            if (!answerText) {
+                answerText = reason || 'Unable to generate an answer.';
             }
 
             // Process markdown
@@ -2428,6 +2534,32 @@
                 };
                 const color = confidenceColors[confidence.toLowerCase()] || '#94a3b8';
                 confidenceBadge = `<span style="display:inline-block;margin-left:8px;padding:2px 8px;background:${color};color:white;border-radius:12px;font-size:11px;font-weight:600;">${confidence}</span>`;
+            }
+
+            // Build images HTML for multimodal responses - show at the beginning
+            let imagesHtml = '';
+            if (isMultimodal && data.images_used && data.images_used.length > 0) {
+                const baseUrl = CONFIG.API.BASE_URL.replace('/api/v1', '');
+                const imageItems = data.images_used.map((imgPath, idx) => {
+                    // Handle both string paths and object paths
+                    let actualPath = '';
+                    if (typeof imgPath === 'string') {
+                        actualPath = imgPath;
+                    } else if (typeof imgPath === 'object' && imgPath.image_path) {
+                        actualPath = imgPath.image_path;
+                    }
+
+                    const imgUrl = actualPath.startsWith('http') ? actualPath : `${baseUrl}/${actualPath}`;
+                    return `
+                        <img src="${imgUrl}" alt="Referenced image ${idx + 1}"
+                             class="message-image"
+                             style="max-width:100%;max-height:300px;border-radius:8px;margin-bottom:12px;cursor:pointer;box-shadow:var(--shadow-md);"
+                             onclick="openImageOverlay('${imgUrl}')"
+                             title="Click to view full size">
+                    `;
+                }).join('');
+
+                imagesHtml = `<div style="margin-bottom:12px;">${imageItems}</div>`;
             }
 
             // Build sources HTML from retrieved_chunks with click handlers for PDF viewer
@@ -2466,21 +2598,15 @@
                 `;
             }
 
-            // Add reason if no answer was found
-            let reasonHtml = '';
-            if (!answerText && reason) {
-                reasonHtml = `<div style="color:var(--text-tertiary);font-style:italic;margin-top:8px;">${escapeHtml(reason)}</div>`;
-            }
-
             // Add model info
-            const modelInfo = data.model_id ? `<div style="font-size:11px;color:var(--text-tertiary);margin-top:8px;">Model: ${data.model_id}</div>` : '';
+            const modelInfo = data.model_id ? `<div style="font-size:11px;color:var(--text-tertiary);margin-top:8px;">Model: ${data.model_id}${isMultimodal ? ' (Multi-modal)' : ''}</div>` : '';
 
             message.innerHTML = `
                 <div class="message-avatar">AI</div>
                 <div class="message-content">
                     <div class="message-bubble">
+                        ${imagesHtml}
                         ${processedText}${confidenceBadge}
-                        ${reasonHtml}
                         ${modelInfo}
                     </div>
                     ${sourcesHtml}
@@ -2492,11 +2618,77 @@
         }
 
         function processMarkdown(text) {
-            // Convert markdown to HTML
-            text = text.replace(/######\s*(.+)/g, '<h6>$1</h6>');
+            if (!text) return '';
+
+            // Escape HTML first to prevent XSS
+            text = text.replace(/&/g, '&amp;')
+                       .replace(/</g, '&lt;')
+                       .replace(/>/g, '&gt;');
+
+            // Code blocks (triple backticks) - must be processed before other formatting
+            text = text.replace(/```(\w*)\n?([\s\S]*?)```/g, (match, lang, code) => {
+                return `<pre style="background:var(--bg-secondary);padding:12px;border-radius:8px;overflow-x:auto;margin:8px 0;"><code>${code.trim()}</code></pre>`;
+            });
+
+            // Inline code (single backticks)
+            text = text.replace(/`([^`]+)`/g, '<code style="background:var(--bg-secondary);padding:2px 6px;border-radius:4px;font-family:monospace;">$1</code>');
+
+            // Headers (h1 to h6)
+            text = text.replace(/^######\s*(.+)$/gm, '<h6 style="margin:12px 0 8px;font-size:14px;">$1</h6>');
+            text = text.replace(/^#####\s*(.+)$/gm, '<h5 style="margin:12px 0 8px;font-size:15px;">$1</h5>');
+            text = text.replace(/^####\s*(.+)$/gm, '<h4 style="margin:14px 0 8px;font-size:16px;">$1</h4>');
+            text = text.replace(/^###\s*(.+)$/gm, '<h3 style="margin:16px 0 8px;font-size:17px;">$1</h3>');
+            text = text.replace(/^##\s*(.+)$/gm, '<h2 style="margin:18px 0 10px;font-size:18px;">$1</h2>');
+            text = text.replace(/^#\s*(.+)$/gm, '<h1 style="margin:20px 0 12px;font-size:20px;">$1</h1>');
+
+            // Bold (double asterisks or double underscores)
             text = text.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-            text = text.replace(/\[(.+?)\]\((.+?)\)/g, '<a href="$2" target="_blank">$1</a>');
+            text = text.replace(/__(.+?)__/g, '<strong>$1</strong>');
+
+            // Italic (single asterisks or single underscores) - must be after bold
+            text = text.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+            text = text.replace(/_([^_]+)_/g, '<em>$1</em>');
+
+            // Strikethrough
+            text = text.replace(/~~(.+?)~~/g, '<del>$1</del>');
+
+            // Unordered lists (lines starting with - or *)
+            text = text.replace(/^[\-\*]\s+(.+)$/gm, '<li style="margin-left:20px;list-style-type:disc;">$1</li>');
+
+            // Numbered lists (lines starting with number.)
+            text = text.replace(/^\d+\.\s+(.+)$/gm, '<li style="margin-left:20px;list-style-type:decimal;">$1</li>');
+
+            // Wrap consecutive <li> items in <ul> or <ol>
+            text = text.replace(/(<li[^>]*style="[^"]*list-style-type:disc[^"]*">[^<]*<\/li>\n?)+/g, (match) => {
+                return '<ul style="margin:8px 0;padding-left:0;">' + match + '</ul>';
+            });
+            text = text.replace(/(<li[^>]*style="[^"]*list-style-type:decimal[^"]*">[^<]*<\/li>\n?)+/g, (match) => {
+                return '<ol style="margin:8px 0;padding-left:0;">' + match + '</ol>';
+            });
+
+            // Blockquotes (lines starting with >)
+            text = text.replace(/^&gt;\s*(.+)$/gm, '<blockquote style="border-left:3px solid var(--primary);margin:8px 0;padding-left:12px;color:var(--text-secondary);">$1</blockquote>');
+
+            // Horizontal rule
+            text = text.replace(/^---+$/gm, '<hr style="border:none;border-top:1px solid var(--border);margin:16px 0;">');
+
+            // Links
+            text = text.replace(/\[(.+?)\]\((.+?)\)/g, '<a href="$2" target="_blank" style="color:var(--primary);text-decoration:underline;">$1</a>');
+
+            // Paragraphs - convert double newlines to paragraph breaks
+            text = text.replace(/\n\n/g, '</p><p style="margin:8px 0;">');
+
+            // Single newlines to line breaks
             text = text.replace(/\n/g, '<br>');
+
+            // Wrap in paragraph if not starting with a block element
+            if (!text.match(/^<(h[1-6]|ul|ol|pre|blockquote|hr)/)) {
+                text = '<p style="margin:0;">' + text + '</p>';
+            }
+
+            // Clean up empty paragraphs
+            text = text.replace(/<p[^>]*><\/p>/g, '');
+
             return text;
         }
 
@@ -2631,6 +2823,28 @@
         function closePDF() {
             document.getElementById('pdfViewer').classList.add('hidden');
         }
+
+        // ===== IMAGE OVERLAY =====
+        function openImageOverlay(imageUrl) {
+            const overlay = document.getElementById('imageOverlay');
+            const overlayImg = document.getElementById('overlayImage');
+            overlayImg.src = imageUrl;
+            overlay.style.display = 'flex';
+            document.body.style.overflow = 'hidden'; // Prevent scrolling
+        }
+
+        function closeImageOverlay() {
+            const overlay = document.getElementById('imageOverlay');
+            overlay.style.display = 'none';
+            document.body.style.overflow = ''; // Restore scrolling
+        }
+
+        // Close overlay with Escape key
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'Escape') {
+                closeImageOverlay();
+            }
+        });
 
         // ===== IMAGE ATTACHMENT =====
         function attachImage() {

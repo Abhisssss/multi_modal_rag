@@ -183,7 +183,7 @@ Content:
 
     def _parse_json_response(self, response: str) -> Dict[str, Any]:
         """
-        Parse JSON from LLM response.
+        Parse JSON from LLM response, handling various formats.
 
         Attempts to extract and parse JSON from the response.
         Falls back to returning the raw text if parsing fails.
@@ -194,17 +194,20 @@ Content:
         Returns:
             Parsed JSON dict or fallback dict with raw answer.
         """
+        import re
+
         if not response:
             return {"answer": None, "reason": "Empty response from LLM"}
 
+        response = response.strip()
+
         # Try direct JSON parse
         try:
-            return json.loads(response.strip())
+            return json.loads(response)
         except json.JSONDecodeError:
             pass
 
         # Try to extract JSON from markdown code blocks
-        import re
         json_patterns = [
             r'```json\s*([\s\S]*?)\s*```',  # ```json ... ```
             r'```\s*([\s\S]*?)\s*```',       # ``` ... ```
@@ -220,13 +223,26 @@ Content:
                 except (json.JSONDecodeError, IndexError):
                     continue
 
+        # Try parsing Python dict format (single quotes, None, True, False)
+        try:
+            match = re.search(r'\{[\s\S]*\}', response)
+            if match:
+                dict_str = match.group(0)
+                # Convert Python dict to JSON format
+                json_str = dict_str.replace("'", '"')
+                json_str = re.sub(r'\bNone\b', 'null', json_str)
+                json_str = re.sub(r'\bTrue\b', 'true', json_str)
+                json_str = re.sub(r'\bFalse\b', 'false', json_str)
+                return json.loads(json_str)
+        except (json.JSONDecodeError, AttributeError):
+            pass
+
         # Fallback: return raw response as answer
         log.warning("Could not parse JSON from response. Returning raw text.")
         return {
-            "answer": response.strip(),
-            "confidence": "unknown",
+            "answer": response,
+            "confidence": "medium",
             "sources": [],
-            "parse_error": "Response was not valid JSON"
         }
 
     def get_available_models(self) -> List[str]:

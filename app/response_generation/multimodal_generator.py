@@ -266,13 +266,15 @@ Content:
         return "\n".join(descriptions), data_urls, valid_images
 
     def _parse_json_response(self, response: str) -> Dict[str, Any]:
-        """Parse JSON from LLM response."""
+        """Parse JSON from LLM response, handling various formats."""
         if not response:
             return {"answer": None, "reason": "Empty response from LLM"}
 
+        response = response.strip()
+
         # Try direct JSON parse
         try:
-            return json.loads(response.strip())
+            return json.loads(response)
         except json.JSONDecodeError:
             pass
 
@@ -292,12 +294,26 @@ Content:
                 except (json.JSONDecodeError, IndexError):
                     continue
 
+        # Try parsing Python dict format (single quotes, None, True, False)
+        try:
+            # Find the JSON-like structure
+            match = re.search(r'\{[\s\S]*\}', response)
+            if match:
+                dict_str = match.group(0)
+                # Convert Python dict to JSON format
+                json_str = dict_str.replace("'", '"')
+                json_str = re.sub(r'\bNone\b', 'null', json_str)
+                json_str = re.sub(r'\bTrue\b', 'true', json_str)
+                json_str = re.sub(r'\bFalse\b', 'false', json_str)
+                return json.loads(json_str)
+        except (json.JSONDecodeError, AttributeError):
+            pass
+
         # Fallback: return raw response as answer
         log.warning("Could not parse JSON from multi-modal response. Returning raw text.")
         return {
-            "answer": response.strip(),
-            "confidence": "unknown",
+            "answer": response,
+            "confidence": "medium",
             "sources": [],
             "images_referenced": [],
-            "parse_error": "Response was not valid JSON"
         }
