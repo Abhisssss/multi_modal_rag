@@ -58,9 +58,12 @@ Open `frontend/insightai-main.html` directly in your browser to access the web i
 
 ### Demo
 
-https://github.com/user-attachments/assets/demo/RAG_VideoDemo.mp4
+### Demo
 
-[View Demo Video](demo/RAG_VideoDemo.mp4)
+[![A demonstration of the RAG system in action](img.youtube.com)](https://youtu.be/xxNcgs_IAik)
+
+
+[View Demo Video File](demo/RAG_VideoDemo.mp4)
 
 ### Tech Stack
 
